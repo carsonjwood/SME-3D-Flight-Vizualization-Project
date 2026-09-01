@@ -1,0 +1,12 @@
+{
+	"telemetry_fields": [
+		{
+			"key": "position",
+			"label": "Position"
+		},
+		{
+			"key": "rotation",
+			"label": "Rotation"
+		}
+	]
+}

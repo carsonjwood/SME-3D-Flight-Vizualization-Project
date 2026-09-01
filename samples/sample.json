@@ -1,0 +1,19 @@
+{
+  "drone_model": "plane_2_9",
+  "position": [0, 0, 0],
+  "rotation": [0, 0, 0],
+  "velocity": [0, 0, 0],
+  "camera_fov": 90,
+  "custom_flag": true,
+  "notes": "This is my test config",
+  "metadata": {
+	"author": "Nicholas",
+	"version": 3
+  },
+  "telemetry_fields": [
+	{ "key": "position", "label": "Position" },
+	{ "key": "rotation", "label": "Rotation" },
+	{ "key": "time",     "label": "Timestamp" },
+	{ "key": "gap",      "label": "Packet" }
+  ]
+}
