@@ -1,0 +1,265 @@
+#|------------------------------------------------------------------------------------
+#|   Unclassified
+#|------------------------------------------------------------------------------------
+#|
+#|   SME Solutions, Inc.
+#|   Copyright 2026 SME Solutions, Inc. All Rights Reserved
+#|   SME Solutions Proprietary Information
+#|
+#|------------------------------------------------------------------------------------
+#|
+#|   File Name   : flightpath_renderer.gd
+#|
+#|   Target      : Godot GDScript
+#|
+#|   Description :
+#|       Flight path renderer that renders a vehicle trajectory using telemetry
+#|       position updates received from the ingestion layer via signal.
+#|
+#|   Notes       :
+#|       This component has not been formally unit tested.
+#|
+#|   POC         :
+#|       Aramis Hernandez
+#|
+#|------------------------------------------------------------------------------------
+
+extends Node3D
+
+## Renders a dynamic 3D flight path using telemetry pose data.
+##
+## This node subscribes to pose updates emitted by the TelemetryManager
+## singleton and renders the trajectory as a continuous line strip using
+## an `ArrayMesh`.
+##
+## Each vertex is colored based on vehicle orientation:
+##
+## - **Red**   → Roll
+## - **Green** → Pitch
+## - **Blue**  → Yaw
+##
+## This allows both trajectory and orientation changes to be visualized
+## simultaneously along the rendered path.
+
+
+
+## Maximum number of vertices retained for the flight path.
+##
+## When the buffer exceeds this limit, the oldest points are removed.
+@export var max_points: int = 2000 
+
+
+## Minimum spatial distance required between consecutive points.
+##
+## Prevents excessive vertex density when telemetry updates occur at
+## high frequency.
+@export var min_distance = 0.2
+
+@export var max_distance = 2.0
+
+## Default line color used when orientation-based coloring is not applied. 
+@export var line_color: Color = Color(0, 1, 0) 
+
+## Buffer storing vertex positions used to construct the flight path mesh.
+var positions: PackedVector3Array = PackedVector3Array() 
+
+## Buffer storing vertex colors corresponding to each path position.
+var colors: PackedColorArray = PackedColorArray() 
+
+## Stores the most recently accepted position used for distance filtering.
+var last_position: Vector3 
+
+## Indicates whether the mesh needs to be rebuilt during the next physics frame.
+var dirty := false 
+
+## When true, the next incoming point will open a new line segment
+## without connecting to the previous last_position.
+## Set by _on_seeked() and cleared on the first point consumed after a seek.
+var _just_seeked: bool = false
+
+## Reference to the MeshInstance3D used to render the generated mesh.
+@onready var mesh_instance: MeshInstance3D = $MeshInstance3D
+
+## Internal ArrayMesh used for dynamic flight path rendering.
+var mesh: ArrayMesh 
+
+
+## Edited by Carson Wood
+## Initializes the flight path renderer and subscribes to telemetry updates.
+##
+## The renderer connects to the `TelemetryManager.pose_received` signal in
+## order to receive position updates from the telemetry system.
+##
+## An unshaded material is used to ensure consistent color representation
+## and reduce GPU overhead on embedded systems (e.g., NVIDIA Jetson).
+func _ready():
+	if not TelemetryManager:
+		push_error("TelemetryManager not found")
+		return
+
+	TelemetryManager.pose_received.connect(add_point)
+
+	mesh = ArrayMesh.new()
+	mesh_instance.mesh = mesh
+
+	var material = StandardMaterial3D.new()
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	material.vertex_color_use_as_albedo = true
+	mesh_instance.material_override = material
+	# Subscribe to seek events so the path can be cleared and redrawn
+	# from the new position without drawing across the screen.
+	TelemetryManager.seeked.connect(_on_seeked)
+
+
+## Adds a new telemetry point to the rendered flight path.
+##
+## This method is connected to the `TelemetryManager.pose_received`
+## signal and is called whenever new pose telemetry is received.
+##
+## Parameters:
+## - `new_pos`: Vehicle position in world coordinates.
+## - `rot`: Rotation vector containing Euler angles (roll, pitch, yaw).
+## - `is_gap`: Indicates a telemetry discontinuity. When true, the vertex
+##   is rendered in red to highlight a data gap.
+## - `_time`: Timestamp associated with the telemetry update.
+func add_point(new_pos: Vector3, rot: Vector3, is_gap: bool, _time) -> void:
+	
+	#Enforce minimum spacing between points.
+	if positions.size() > 0:
+		if new_pos.distance_to(last_position) < min_distance:
+			return 
+		# Suppress distance-based gap detection immediately after a seek.
+		# The jump in position is expected and should not be marked as a gap.
+		if not _just_seeked and new_pos.distance_to(last_position) > max_distance:
+			is_gap = true
+		# Open a new segment at the first point after a seek so no line
+		# is drawn from the old last_position to the new scrub position.
+		if _just_seeked:
+			is_gap = true
+			_just_seeked = false
+	positions.append(new_pos)
+	
+	#Orentation color mapping 
+	# roll -> red
+	# pitch -> green
+	# yaw -> blue
+	var r := _angle_to_color_value(rot.x) # roll
+	var g := _angle_to_color_value(rot.y) # pitch
+	var b := _angle_to_color_value(rot.z) # yaw
+	line_color = Color(r, g, b)
+	# print("[FLight path renderer: ]" + str(line_color))
+	
+	var c = line_color
+	
+	#Mark telemetry gaps visually
+	if is_gap:
+		c = Color(1, 0, 0) 
+		
+	colors.append(c)
+	last_position = new_pos
+	
+	# Maintain bounded memory usage
+	if positions.size() > max_points:
+		# NOTE: 
+		# This operation shifts the entire array and may be expensive
+		# for very large paths.
+		positions.remove_at(0) 
+		colors.remove_at(0)
+	
+	dirty = true	
+
+## Physics update loop responsible for rebuilding the mesh when needed.
+func _physics_process(_delta):
+	if dirty:
+		_rebuild_mesh()
+		dirty = false
+
+## Rebuilds the mesh from the current position and color buffers.
+##
+## The mesh is rendered as a `PRIMITIVE_LINE_STRIP`, connecting each
+## vertex sequentially to form a continuous trajectory path.s
+func _rebuild_mesh():
+	if positions.size() < 2:
+		return
+		
+	mesh.clear_surfaces()
+	
+	var seg_verts: PackedVector3Array = PackedVector3Array()
+	var seg_colors: PackedColorArray = PackedColorArray()
+	for i in range(positions.size()):
+		var is_break = (colors[i] == Color(1, 0, 0)) and i > 0
+		
+		if is_break and seg_verts.size() >= 2:
+			_flush_segment(seg_verts, seg_colors)
+			seg_verts = PackedVector3Array()
+			seg_colors = PackedColorArray()
+		seg_verts.append(positions[i])
+		seg_colors.append(colors[i])
+		
+	if seg_verts.size() >= 2:
+			_flush_segment(seg_verts, seg_colors)
+
+#func _rebuild_mesh():
+	#if positions.size() < 2:
+		#return
+	#
+	#mesh.clear_surfaces()
+	#
+	#var arrays = []
+	#arrays.resize(Mesh.ARRAY_MAX)
+	#
+	#arrays[Mesh.ARRAY_VERTEX] = positions
+	#arrays[Mesh.ARRAY_COLOR] = colors
+	#
+	#mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINE_STRIP, arrays)
+
+func _flush_segment(verts: PackedVector3Array, cols: PackedColorArray) -> void:
+	var arrays = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_COLOR]  = cols
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINE_STRIP, arrays)
+
+## Clears all buffered positions, colors, and the rendered mesh.
+##
+## Called before replaying telemetry from a seeked position to prevent
+## stale points from connecting to incoming ones.
+func reset_path() -> void:
+	positions.clear()
+	colors.clear()
+	last_position = Vector3.ZERO
+	mesh.clear_surfaces()
+	dirty = false
+
+## Handles a seek event emitted by TelemetryManager.
+##
+## Clears the current path and arms the _just_seeked flag so the
+## first replayed point opens a fresh line segment rather than
+## connecting to the previous last_position.
+##
+## Parameters:
+##   _index : int
+##       The frame index seeked to. Unused by the renderer but
+##       required to match the signal signature.
+func _on_seeked(_index: int) -> void:
+	reset_path()
+	_just_seeked = true
+
+
+## Converts an angular value in radians into a normalized value
+## suitable for use as a color component.
+##
+## Input range:
+## -PI .. PI
+##
+## Output range:
+## 0.0 .. 1.0
+##
+## Parameter:
+## - `angle`: Angle in radians.
+##
+## Returns:
+## Normalized float value suitable for RGB color channels.
+func _angle_to_color_value(angle: float) -> float:
+	# Convert from -PI..PI → 0..1
+	return clamp((angle + PI) / (2.0 * PI), 0.0, 1.0)
